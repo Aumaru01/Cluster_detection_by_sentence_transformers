@@ -1,0 +1,10 @@
+nohup.log
+nohup.out
+pycache/
+__pycache__/
+/venv/
+env/
+venv/
+__pycache__/
+*__pycache__*
+/logs/

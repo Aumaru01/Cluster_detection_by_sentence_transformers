@@ -1,0 +1,24 @@
+model:
+  name: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  max_token: 128
+  use_gpu: true
+
+clustering:
+  threshold: 0.65   # default threshold for cosine similarity if request not provided threshold
+  top_k: 5          # FAISS candidate neighbours retrieved per query
+  max_clusters: 1000000
+  batch_size: 64
+
+persistence:
+  save_path: null   # set to a path, e.g. ./data/model, to persist state on shutdown
+
+api:
+  prefix: /api/v1
+  host: 0.0.0.0
+  port: 50000
+
+logging:
+  level: INFO          # DEBUG | INFO | WARNING | ERROR
+  log_dir: logs        # directory to write log files
+  max_bytes: 10485760  # 10 MB — rotate when file exceeds this size
+

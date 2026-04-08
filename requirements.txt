@@ -1,0 +1,14 @@
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Validation & config
+pydantic>=2.7.0
+pyyaml>=6.0.1
+
+# ML
+sentence-transformers>=3.0.0
+faiss-cpu           # swap for faiss-gpu when use_gpu: true in config.yaml
+faiss-gpu           # swap for faiss-gpu when use_gpu: true in config.yaml
+numpy>=1.26.0
+torch==2.7.1+cu118
