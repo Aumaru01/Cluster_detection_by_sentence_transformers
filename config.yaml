@@ -1,8 +1,12 @@
 model:
+  # embedding_model_path: facebook/drama-1b
+  # tokenizer_path: facebook/drama-1b
   embedding_model_path: facebook/drama-large
   tokenizer_path: facebook/drama-large
+  # embedding_model_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  # tokenizer_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
   max_token: 128
-  use_gpu: true
+  use_gpu: false
 
 clustering:
   threshold: 0.6   # default threshold for cosine similarity if request not provided threshold
