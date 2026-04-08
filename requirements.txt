@@ -7,8 +7,7 @@ pydantic>=2.7.0
 pyyaml>=6.0.1
 
 # ML
-sentence-transformers>=3.0.0
+transformers>=4.40.0
+torch>=2.0.0
 faiss-cpu           # swap for faiss-gpu when use_gpu: true in config.yaml
-faiss-gpu           # swap for faiss-gpu when use_gpu: true in config.yaml
-numpy>=1.26.0
-torch==2.7.1+cu118
+faiss-gpu           # swap for faiss-cpu when use_gpu: false

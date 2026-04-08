@@ -4,7 +4,7 @@ FastAPI application — single-file sentence clustering API.
 Pipeline flow:
   1. Request arrives (POST /clusters or /clusters/assign)
   2. Texts are MD5-fingerprinted for deduplication
-  3. SentenceClusterer (FAISS + SentenceTransformer) processes them
+  3. SentenceClusterer (FAISS + AutoModel/AutoTokenizer) processes them
   4. Results are mapped back to human-readable text and returned
 """
 import time
@@ -22,7 +22,7 @@ from typing import AsyncIterator, Optional
 import yaml
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from sentence_transformers import SentenceTransformer
+from transformers import AutoModel, AutoTokenizer
 
 from sentence_clusterer import SentenceClusterer
 from zip_log_file_handling import setup_logging
@@ -42,14 +42,17 @@ logger = logging.getLogger(__name__)
 # Shared state & clustering helper
 # ══════════════════════════════════════════════════════════════════════════════
 
-_model: Optional[SentenceTransformer] = None
+_model: Optional[AutoModel] = None
+_tokenizer: Optional[AutoTokenizer] = None
 
 
 def _new_clusterer() -> SentenceClusterer:
-    if _model is None:
-        raise RuntimeError("Shared model not initialised — check lifespan.")
+    if _model is None or _tokenizer is None:
+        raise RuntimeError("Shared model/tokenizer not initialised — check lifespan.")
     return SentenceClusterer(
         model=_model,
+        tokenizer=_tokenizer,
+        max_token=cfg["model"]["max_token"],
         threshold=cfg["clustering"]["threshold"],
         top_k=cfg["clustering"]["top_k"],
         max_clusters=cfg["clustering"]["max_clusters"],
@@ -119,18 +122,26 @@ async def _run_clustering(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global _model
+    global _model, _tokenizer
 
     m = cfg["model"]
     device = "cuda" if m["use_gpu"] else "cpu"
-    logger.info("Startup — loading model | name=%s  device=%s  max_token=%d", m["name"], device, m["max_token"])
+
+    embedding_model_path = m["embedding_model_path"]
+    tokenizer_path = m["tokenizer_path"]
+
+    logger.info(
+        "Startup — loading model & tokenizer | embedding_model=%s  tokenizer=%s  device=%s  max_token=%d",
+        embedding_model_path, tokenizer_path, device, m["max_token"],
+    )
 
     t0 = time.perf_counter()
-    _model = SentenceTransformer(m["name"], device=device)
-    _model.max_seq_length = m["max_token"]
+    _tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    _model = AutoModel.from_pretrained(embedding_model_path).to(device)
+    _model.eval()
     elapsed = time.perf_counter() - t0
 
-    logger.info("Model ready | elapsed=%.2fs  embedding_dim=%d", elapsed, _model.get_sentence_embedding_dimension())
+    logger.info("Model & tokenizer ready | elapsed=%.2fs  hidden_size=%d", elapsed, _model.config.hidden_size)
     logger.info(
         "Clustering config | threshold=%.2f  top_k=%d  max_clusters=%s  batch_size=%d",
         cfg["clustering"]["threshold"], cfg["clustering"]["top_k"],
@@ -191,7 +202,7 @@ def create_app() -> FastAPI:
     ):
         if threshold is None:
             threshold = cfg["clustering"]["threshold"]
-        
+
         sentences = body.get("sentences", [])
         texts = [t or "" for t in sentences]
         logger.info("POST /clusters | sentences=%d  least_items=%d", len(texts), least_items)
@@ -201,12 +212,13 @@ def create_app() -> FastAPI:
             clusters = clusters[:limit_cluster]
 
         output = {"clusters": clusters, "total_clusters": len(clusters)}
-        
+
         if debug:
             os.makedirs("result", exist_ok=True)
             with open(f"result/clusters_{int(time.time())}.json", "w", encoding="utf-8") as f:
                 yaml.dump(output, f, allow_unicode=True)
-        return 
+                
+        return output
 
     # ── POST /clusters/assign ─────────────────────────────────────────────────
     @app.post(f"{prefix}/clusters/assign", tags=["clusters"])
@@ -220,7 +232,7 @@ def create_app() -> FastAPI:
 
         if threshold is None:
             threshold = cfg["clustering"]["threshold"]
-        
+
         texts = [f"{doc.get('Headline') or ''} {doc.get('Story') or ''}".strip() for doc in body]
         doc_id_list = [doc.get("DocumentID", "") for doc in body]
 
@@ -262,12 +274,10 @@ def create_app() -> FastAPI:
         
         if debug:
             os.makedirs("result", exist_ok=True)
-            with open(f"result/cluster_assignments_{int(time.time())}.csv", "w", encoding="utf-8") as f:
-                f.write(f"Threshold: {threshold}\n")
-                f.write("DocumentID,Headline,Story,Cluster\n")
-                for item in output:
-                    f.write(f"{item['DocumentID']},{item['Headline']},{item['Story']},{item['Cluster']}\n")
-        
+            logger.info("Debug mode enabled — saving cluster assignments to result/assign_{timestamp}.json")
+            logger.info(f"Threshold: {threshold}\n")
+            with open(f"result/assign_{int(time.time())}.json", "w", encoding="utf-8") as f:
+                yaml.dump(output, f, allow_unicode=True)
         return output
 
     return app

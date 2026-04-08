@@ -1,9 +1,12 @@
 """
 Core sentence clustering engine using FAISS for approximate nearest-neighbour search
-and SentenceTransformer for multilingual embeddings.
+and HuggingFace Transformers (AutoModel + AutoTokenizer) for multilingual embeddings.
 
-Removed from original: NER extraction/matching, trending score weights,
-blacklist logic, dead/commented-out methods (ask_tmp).
+Encoding pipeline:
+  1. Tokenize with AutoTokenizer (padding + truncation)
+  2. Forward pass through AutoModel
+  3. Mean pooling over token embeddings (attention-mask aware)
+  4. L2-normalise → unit vectors for cosine similarity via inner product
 """
 
 import logging
@@ -16,17 +19,31 @@ from typing import Optional
 import faiss
 import numpy as np
 import torch
-from sentence_transformers import SentenceTransformer
+import torch.nn.functional as F
+from transformers import AutoModel, AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def mean_pooling(model_output, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Average token embeddings weighted by the attention mask."""
+    token_embeddings = model_output[0]  # (batch, seq_len, hidden)
+    mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    return torch.sum(token_embeddings * mask_expanded, dim=1) / torch.clamp(
+        mask_expanded.sum(dim=1), min=1e-9
+    )
 
 
 class SentenceClusterer:
     def __init__(
         self,
         load_path: Optional[str] = None,
-        model: Optional[SentenceTransformer] = None,
-        model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        model: Optional[AutoModel] = None,
+        tokenizer: Optional[AutoTokenizer] = None,
+        embedding_model_path: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        tokenizer_path: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         max_token: int = 128,
         threshold: float = 0.9,
         top_k: int = 5,
@@ -35,6 +52,7 @@ class SentenceClusterer:
     ) -> None:
         self.use_gpu = use_gpu
         self.device = "cuda" if use_gpu else "cpu"
+        self.max_token = max_token
 
         if load_path:
             logger.info("Loading SentenceClusterer from disk | path=%s", load_path)
@@ -47,18 +65,27 @@ class SentenceClusterer:
             )
             return
 
-        if model:
+        # ── Model ──
+        if model is not None:
             self.model = model
             logger.debug("Using pre-loaded shared model | id=%d", id(model))
         else:
-            logger.info("Loading SentenceTransformer | name=%s  device=%s", model_name, self.device)
-            self.model = SentenceTransformer(model_name, device=self.device)
-            self.model.max_seq_length = max_token
-            logger.info("SentenceTransformer loaded")
+            logger.info("Loading AutoModel | path=%s  device=%s", embedding_model_path, self.device)
+            self.model = AutoModel.from_pretrained(embedding_model_path).to(self.device)
+            logger.info("AutoModel loaded")
+
+        # ── Tokenizer ──
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+            logger.debug("Using pre-loaded shared tokenizer | id=%d", id(tokenizer))
+        else:
+            logger.info("Loading AutoTokenizer | path=%s", tokenizer_path)
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            logger.info("AutoTokenizer loaded")
 
         self.threshold = threshold
         self.top_k = top_k
-        self.embedding_dim: int = self.model.get_sentence_embedding_dimension()
+        self.embedding_dim: int = self.model.config.hidden_size
         self.index = faiss.IndexIDMap(faiss.IndexFlatIP(self.embedding_dim))
 
         # cluster_id → set of doc_ids
@@ -87,7 +114,8 @@ class SentenceClusterer:
         logger.info("Saving state | dir=%s  clusters=%d", save_dir, len(self.trend))
         os.makedirs(save_dir, exist_ok=True)
         faiss.write_index(self.index, os.path.join(save_dir, "faiss_index"))
-        self.model.save(os.path.join(save_dir, "model"))
+        self.model.save_pretrained(os.path.join(save_dir, "model"))
+        self.tokenizer.save_pretrained(os.path.join(save_dir, "tokenizer"))
         with open(os.path.join(save_dir, "attributes.pkl"), "wb") as f:
             pickle.dump(
                 {
@@ -98,14 +126,18 @@ class SentenceClusterer:
                     "cluster_now_idx": self.cluster_now_idx,
                     "oldest_cluster_idx": self.oldest_cluster_idx,
                     "max_clusters": self.max_clusters,
+                    "max_token": self.max_token,
                 },
                 f,
             )
         logger.info("State saved successfully | dir=%s", save_dir)
 
     def _load(self, load_dir: str) -> None:
-        self.model = SentenceTransformer(
-            os.path.join(load_dir, "model"), device=self.device
+        self.model = AutoModel.from_pretrained(
+            os.path.join(load_dir, "model")
+        ).to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            os.path.join(load_dir, "tokenizer")
         )
         self.index = faiss.read_index(os.path.join(load_dir, "faiss_index"))
         with open(os.path.join(load_dir, "attributes.pkl"), "rb") as f:
@@ -117,6 +149,7 @@ class SentenceClusterer:
         self.cluster_now_idx = attrs["cluster_now_idx"]
         self.oldest_cluster_idx = attrs["oldest_cluster_idx"]
         self.max_clusters = attrs["max_clusters"]
+        self.max_token = attrs.get("max_token", 128)
         self.embedding_dim = self.index.d
         self._assigned_ids = set().union(*self.trend.values()) if self.trend else set()
 
@@ -125,17 +158,35 @@ class SentenceClusterer:
     # ------------------------------------------------------------------
 
     def encode(self, texts: list[str]) -> np.ndarray:
+        """
+        Tokenize → forward → mean pooling → L2 normalise.
+
+        Returns (N, hidden_size) float32 numpy array of unit-length embeddings.
+        """
         logger.debug("Encoding %d texts | device=%s", len(texts), self.device)
         t0 = time.perf_counter()
-        embeddings = self.model.encode(
+
+        # 1. Tokenize
+        encoded_input = self.tokenizer(
             texts,
-            convert_to_numpy=True,
-            batch_size=128,
-            normalize_embeddings=True,
-            device=self.device,
-        )
+            padding=True,
+            truncation=True,
+            max_length=self.max_token,
+            return_tensors="pt",
+        ).to(self.device)
+
+        # 2. Forward pass (no gradient needed)
+        with torch.no_grad():
+            model_output = self.model(**encoded_input)
+
+        # 3. Mean pooling
+        sentence_embeddings = mean_pooling(model_output, encoded_input["attention_mask"])
+
+        # 4. L2 normalise
+        sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
+
+        result = sentence_embeddings.cpu().numpy().astype(np.float32)
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        result = embeddings.astype(np.float32)
         logger.debug(
             "Encoding done | texts=%d  shape=%s  elapsed=%.1fms",
             len(texts),
