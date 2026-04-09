@@ -28,3 +28,5 @@ logging:
   level: INFO          # DEBUG | INFO | WARNING | ERROR
   log_dir: logs        # directory to write log files
   max_bytes: 10485760  # 10 MB — rotate when file exceeds this size
+
+debug: false          # if true, saves input and output of /clusters/assign to result/ with timestamped filenames

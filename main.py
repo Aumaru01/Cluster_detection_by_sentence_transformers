@@ -7,6 +7,7 @@ Pipeline flow:
   3. SentenceClusterer (FAISS + AutoModel/AutoTokenizer) processes them
   4. Results are mapped back to human-readable text and returned
 """
+import json
 import time
 import asyncio
 import hashlib
@@ -17,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Optional, Union
 
 import yaml
 from fastapi import FastAPI, Query, Request, Response
@@ -198,8 +199,10 @@ def create_app() -> FastAPI:
         threshold: Optional[float] = Query(default=None, ge=0.0, le=1.0),
         least_items: int = Query(default=2, ge=1),
         limit_cluster: int = Query(default=0, ge=0),
-        debug: bool = Query(default=False)
-    ):
+        ):
+        
+        debug = cfg["debug"]
+        
         if threshold is None:
             threshold = cfg["clustering"]["threshold"]
 
@@ -216,18 +219,29 @@ def create_app() -> FastAPI:
         if debug:
             os.makedirs("result", exist_ok=True)
             with open(f"result/clusters_{int(time.time())}.json", "w", encoding="utf-8") as f:
-                yaml.dump(output, f, allow_unicode=True)
-                
+                json.dump(output, f, ensure_ascii=False, indent=4)
+
         return output
 
     # ── POST /clusters/assign ─────────────────────────────────────────────────
     @app.post(f"{prefix}/clusters/assign", tags=["clusters"])
-    async def assign_clusters(  body: list[dict],
+    async def assign_clusters(  body: Union[list[dict], dict],
                                 threshold: Optional[float] = Query(default=None, ge=0.0, le=1.0),
                                 limit_cluster: int = Query(default=0, ge=0),
                                 limit_cluster_item: int = Query(default=0, ge=0),
-                                debug: bool = Query(default=False)
                             ):
+        
+        debug = cfg["debug"]
+        #save body in debug
+        if debug:  
+                os.makedirs("result", exist_ok=True)
+                logger.info("Debug mode enabled — saving input documents to result/assign_input_{timestamp}.json")
+                with open(f"result/body_{int(time.time())}.json", "w", encoding="utf-8") as f:
+                    json.dump(body, f, ensure_ascii=False, indent=4)
+        
+        if isinstance(body, dict):
+            body = [body]
+            
         logger.info("POST /clusters/assign | documents=%d", len(body))
         try:
             if threshold is None:
@@ -276,9 +290,11 @@ def create_app() -> FastAPI:
                 os.makedirs("result", exist_ok=True)
                 logger.info("Debug mode enabled — saving cluster assignments to result/assign_{timestamp}.json")
                 logger.info(f"Threshold: {threshold}\n")
-                with open(f"result/assign_{int(time.time())}.json", "w", encoding="utf-8") as f:
-                    yaml.dump(output, f, allow_unicode=True)
+                with open(f"result/clustered_{int(time.time())}.json", "w", encoding="utf-8") as f:
+                    json.dump(output, f, ensure_ascii=False, indent=4)
+                    
             return output
+        
         except Exception as e:
             logger.exception("Error in /clusters/assign: %s", str(e))
             return {"error": str(e)}
