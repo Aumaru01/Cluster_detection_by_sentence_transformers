@@ -1,12 +1,14 @@
 model:
-  # embedding_model_path: facebook/drama-1b
-  # tokenizer_path: facebook/drama-1b
-  embedding_model_path: facebook/drama-large
-  tokenizer_path: facebook/drama-large
-  # embedding_model_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-  # tokenizer_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  # embedding_model_path: intfloat/multilingual-e5-large  ######### Poor results
+  # tokenizer_path: intfloat/multilingual-e5-large        ######### Poor results
+  embedding_model_path: facebook/drama-large            ######### Best results
+  tokenizer_path: facebook/drama-large                  ######### Best results
+  # embedding_model_path: facebook/drama-base
+  # tokenizer_path: facebook/drama-base
+  # embedding_model_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 ######### Base
+  # tokenizer_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2       ######### Base
   max_token: 128
-  use_gpu: false
+  use_gpu: true
 
 clustering:
   threshold: 0.6   # default threshold for cosine similarity if request not provided threshold

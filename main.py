@@ -229,56 +229,59 @@ def create_app() -> FastAPI:
                                 debug: bool = Query(default=False)
                             ):
         logger.info("POST /clusters/assign | documents=%d", len(body))
+        try:
+            if threshold is None:
+                threshold = cfg["clustering"]["threshold"]
 
-        if threshold is None:
-            threshold = cfg["clustering"]["threshold"]
+            texts = [f"{doc.get('Headline') or ''} {doc.get('Story') or ''}".strip() for doc in body]
+            doc_id_list = [doc.get("DocumentID", "") for doc in body]
 
-        texts = [f"{doc.get('Headline') or ''} {doc.get('Story') or ''}".strip() for doc in body]
-        doc_id_list = [doc.get("DocumentID", "") for doc in body]
+            clusters = await _run_clustering(texts, least_items=1, threshold=threshold)
 
-        clusters = await _run_clustering(texts, least_items=1, threshold=threshold)
+            # Map text → cluster_id
+            text_to_cluster: dict[str, int] = {}
+            for c in clusters:
+                for sentence in c["sentences"]:
+                    text_to_cluster[sentence] = c["cluster_id"]
 
-        # Map text → cluster_id
-        text_to_cluster: dict[str, int] = {}
-        for c in clusters:
-            for sentence in c["sentences"]:
-                text_to_cluster[sentence] = c["cluster_id"]
+            assignments = [(did, text_to_cluster.get(txt, -1)) for txt, did in zip(texts, doc_id_list)]
 
-        assignments = [(did, text_to_cluster.get(txt, -1)) for txt, did in zip(texts, doc_id_list)]
+            # Group by cluster, sort by size descending
+            cluster_groups: dict[int, list[tuple[str, int]]] = {}
+            for doc_id, cluster_id in assignments:
+                cluster_groups.setdefault(cluster_id, []).append((doc_id, cluster_id))
 
-        # Group by cluster, sort by size descending
-        cluster_groups: dict[int, list[tuple[str, int]]] = {}
-        for doc_id, cluster_id in assignments:
-            cluster_groups.setdefault(cluster_id, []).append((doc_id, cluster_id))
+            sorted_clusters = sorted(cluster_groups.values(), key=len, reverse=True)
+            if limit_cluster > 0:
+                sorted_clusters = sorted_clusters[:limit_cluster]
+            if limit_cluster_item > 0:
+                sorted_clusters = [g[:limit_cluster_item] for g in sorted_clusters]
 
-        sorted_clusters = sorted(cluster_groups.values(), key=len, reverse=True)
-        if limit_cluster > 0:
-            sorted_clusters = sorted_clusters[:limit_cluster]
-        if limit_cluster_item > 0:
-            sorted_clusters = [g[:limit_cluster_item] for g in sorted_clusters]
+            result_items = [item for group in sorted_clusters for item in group]
 
-        result_items = [item for group in sorted_clusters for item in group]
-
-        headline_map = {doc.get("DocumentID", ""): doc.get("Headline") for doc in body}
-        story_map = {doc.get("DocumentID", ""): doc.get("Story") for doc in body}
-        
-        output = [
-            {
-                "DocumentID": doc_id,
-                "Headline": headline_map.get(doc_id),
-                "Story": story_map.get(doc_id),
-                "Cluster": str(cluster_id),
-            }
-            for doc_id, cluster_id in result_items
-        ]
-        
-        if debug:
-            os.makedirs("result", exist_ok=True)
-            logger.info("Debug mode enabled — saving cluster assignments to result/assign_{timestamp}.json")
-            logger.info(f"Threshold: {threshold}\n")
-            with open(f"result/assign_{int(time.time())}.json", "w", encoding="utf-8") as f:
-                yaml.dump(output, f, allow_unicode=True)
-        return output
+            headline_map = {doc.get("DocumentID", ""): doc.get("Headline") for doc in body}
+            story_map = {doc.get("DocumentID", ""): doc.get("Story") for doc in body}
+            
+            output = [
+                {
+                    "DocumentID": doc_id,
+                    "Headline": headline_map.get(doc_id),
+                    "Story": story_map.get(doc_id),
+                    "Cluster": str(cluster_id),
+                }
+                for doc_id, cluster_id in result_items
+            ]
+            
+            if debug:
+                os.makedirs("result", exist_ok=True)
+                logger.info("Debug mode enabled — saving cluster assignments to result/assign_{timestamp}.json")
+                logger.info(f"Threshold: {threshold}\n")
+                with open(f"result/assign_{int(time.time())}.json", "w", encoding="utf-8") as f:
+                    yaml.dump(output, f, allow_unicode=True)
+            return output
+        except Exception as e:
+            logger.exception("Error in /clusters/assign: %s", str(e))
+            return {"error": str(e)}
 
     return app
 
