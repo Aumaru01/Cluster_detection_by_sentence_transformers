@@ -8,12 +8,11 @@ Groups semantically similar sentences into clusters using FAISS-backed approxima
 
 1. [Overview](#overview)
 2. [Project Structure](#project-structure)
-3. [Quick Start (Local)](#quick-start-local)
-4. [Quick Start (Docker)](#quick-start-docker)
-5. [API Reference](#api-reference)
-6. [Configuration](#configuration)
-7. [Design Decisions](#design-decisions)
-8. [How to Scale for Concurrent Users](#how-to-scale-for-concurrent-users)
+3. [Quick Start](#quick-start)
+4. [API Reference](#api-reference)
+5. [Configuration](#configuration)
+6. [Design Decisions](#design-decisions)
+7. [How to Scale for Concurrent Users](#how-to-scale-for-concurrent-users)
 
 ---
 
@@ -41,8 +40,6 @@ The service accepts a list of sentences, incrementally assigns them to semantic 
 ├── zip_log_file_handling.py   # Rotating log handler with auto-compression
 ├── config.yaml                # All configurable parameters
 ├── requirements.txt           # Python dependencies
-├── Dockerfile                 # Single-process Python 3.11 container
-├── docker-compose.yml         # Service config, health checks, volume mounts
 └── README.md
 ```
 
@@ -50,7 +47,7 @@ The project uses a **flat single-file architecture**: all HTTP endpoints live in
 
 ---
 
-## Quick Start (Local)
+## Quick Start
 
 ### Prerequisites
 
@@ -77,20 +74,6 @@ python -m main
 
 The API is available at `http://localhost:8000`.
 Interactive docs: `http://localhost:8000/docs`
-
----
-
-## Quick Start (Docker)
-
-```bash
-# Build and start
-docker compose up --build
-
-# Stop
-docker compose down
-```
-
-To persist the FAISS index across restarts, the compose file mounts `./data/model` into the container. Set `save_path` in `config.yaml` to `/app/data/model` to enable persistence.
 
 ---
 
@@ -302,12 +285,7 @@ Client → Load Balancer (nginx / k8s Ingress)
 
 Each shard has its own FAISS state. Route requests consistently to the same shard.
 
-The `docker-compose.yml` includes commented-out examples for additional workers and an nginx load balancer.
-
 ### Fully stateless scaling
 
 Since each request already gets a fresh `SentenceClusterer`, replicas are fully independent. Standard round-robin load balancing works out of the box.
-
-```bash
-docker compose up --scale api=3
-```
+                   
