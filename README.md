@@ -63,7 +63,8 @@ cd transformer-sentence-cluster
 
 # 2. Create and activate a virtual environment
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate     # Linux
+.venv\Scripts\activate       # Windows
 
 # 3. Install dependencies
 pip install -r requirements.txt
