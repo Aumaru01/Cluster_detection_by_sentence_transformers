@@ -1,76 +1,34 @@
 # Sentence Clustering API
 
-Groups semantically similar sentences into clusters using FAISS-backed approximate nearest-neighbour search and multilingual sentence embeddings (`paraphrase-multilingual-MiniLM-L12-v2`).
+Groups semantically similar sentences into clusters using FAISS-backed approximate nearest-neighbour search and multilingual sentence embeddings (`facebook/drama-large`).
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Architecture](#architecture)
-3. [Project Structure](#project-structure)
-4. [Quick Start (Local)](#quick-start-local)
-5. [Quick Start (Docker)](#quick-start-docker)
-6. [API Reference](#api-reference)
-7. [Configuration](#configuration)
-8. [Design Decisions](#design-decisions)
-9. [How to Scale for Concurrent Users](#how-to-scale-for-concurrent-users)
-10. [How to Add a Feature](#how-to-add-a-feature)
+2. [Project Structure](#project-structure)
+3. [Quick Start (Local)](#quick-start-local)
+4. [Quick Start (Docker)](#quick-start-docker)
+5. [API Reference](#api-reference)
+6. [Configuration](#configuration)
+7. [Design Decisions](#design-decisions)
+8. [How to Scale for Concurrent Users](#how-to-scale-for-concurrent-users)
 
 ---
 
 ## Overview
 
-The service accepts a list of sentences (with IDs and optional timestamps), incrementally assigns them to semantic clusters, and returns the current cluster state. Sentences can be removed from clusters on subsequent calls via `remove_ids`.
+The service accepts a list of sentences, incrementally assigns them to semantic clusters via FAISS, and returns the current cluster state. Each request gets a **fresh** `SentenceClusterer` so state never leaks between calls.
 
 **Use case:** trending topic detection — periodically push new articles/headlines and receive groupings of semantically related content.
 
----
+### Encoding pipeline
 
-## Architecture
-
-The project follows **Hexagonal Architecture** (Ports & Adapters), also known as the *Clean Architecture* model.
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                        Adapters                          │
-│                                                          │
-│  Inbound (HTTP)          Outbound (ML / Storage)         │
-│  ┌───────────────┐       ┌──────────────────────────┐    │
-│  │  FastAPI      │       │  FaissClustererAdapter   │    │
-│  │  Router       │       │  (wraps SentenceClusterer│    │
-│  │  Schemas      │       │   + asyncio.Lock)        │    │
-│  └──────┬────────┘       └────────────┬─────────────┘    │
-│         │                             │                  │
-│         ▼                             ▼                  │
-│  ┌──────────────────────────────────────────────────┐    │
-│  │              Application Layer                   │    │
-│  │           ClusteringService (use case)           │    │
-│  └──────────────────────┬───────────────────────────┘    │
-│                         │                                │
-│                         ▼                                │
-│  ┌──────────────────────────────────────────────────┐    │
-│  │                  Domain Layer                    │    │
-│  │   Sentence  ·  Cluster  ·  ClusteringPort (ABC) │    │
-│  └──────────────────────────────────────────────────┘    │
-│                                                          │
-│  Infrastructure: Settings · DI wiring · lifespan        │
-└──────────────────────────────────────────────────────────┘
-        │
-        ▼
-   ml/sentence_clusterer.py   ← pure ML engine (no framework deps)
-```
-
-### Layer responsibilities
-
-| Layer | Responsibility | May depend on |
-|---|---|---|
-| **Domain** | Business models (`Sentence`, `Cluster`) and the `ClusteringPort` interface | Nothing |
-| **Application** | Use-case orchestration (`ClusteringService`) | Domain only |
-| **Adapters/Inbound** | HTTP concerns: Pydantic schemas, routing | Application + Domain |
-| **Adapters/Outbound** | Concrete ML implementation | Domain port + `ml/` |
-| **Infrastructure** | Framework wiring, config, DI | All layers |
-| **ml/** | Standalone ML engine | NumPy, FAISS, SentenceTransformers |
+1. Tokenize with `AutoTokenizer` (padding + truncation)
+2. Forward pass through `AutoModel`
+3. Mean pooling over token embeddings (attention-mask aware)
+4. L2-normalise → unit vectors for cosine similarity via inner product
 
 ---
 
@@ -78,33 +36,17 @@ The project follows **Hexagonal Architecture** (Ports & Adapters), also known as
 
 ```
 .
-├── app/
-│   ├── main.py                          # FastAPI app + lifespan
-│   ├── domain/
-│   │   ├── models/
-│   │   │   ├── sentence.py              # Sentence dataclass
-│   │   │   └── cluster.py              # Cluster dataclass
-│   │   └── ports/
-│   │       └── clustering_port.py      # Abstract ClusteringPort
-│   ├── application/
-│   │   └── clustering_service.py       # Use-case: cluster_sentences / get_stats
-│   ├── adapters/
-│   │   ├── inbound/http/
-│   │   │   ├── router.py               # FastAPI endpoints
-│   │   │   └── schemas.py              # Pydantic request/response
-│   │   └── outbound/
-│   │       └── faiss_clusterer_adapter.py  # Implements ClusteringPort
-│   └── infrastructure/
-│       ├── config.py                   # Pydantic Settings
-│       └── dependencies.py             # FastAPI DI wiring
-├── ml/
-│   └── sentence_clusterer.py           # Core FAISS+SentenceTransformer engine
-├── requirements.txt
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example
+├── main.py                    # FastAPI app, endpoints, model lifespan
+├── sentence_clusterer.py      # Core FAISS + AutoModel/AutoTokenizer engine
+├── zip_log_file_handling.py   # Rotating log handler with auto-compression
+├── config.yaml                # All configurable parameters
+├── requirements.txt           # Python dependencies
+├── Dockerfile                 # Single-process Python 3.11 container
+├── docker-compose.yml         # Service config, health checks, volume mounts
 └── README.md
 ```
+
+The project uses a **flat single-file architecture**: all HTTP endpoints live in `main.py`, and the ML engine lives in `sentence_clusterer.py`.
 
 ---
 
@@ -117,7 +59,7 @@ The project follows **Hexagonal Architecture** (Ports & Adapters), also known as
 
 ```bash
 # 1. Clone / enter the project
-cd api_for_pjack
+cd transformer-sentence-cluster
 
 # 2. Create and activate a virtual environment
 python -m venv .venv
@@ -126,12 +68,10 @@ source .venv/bin/activate        # Windows: .venv\Scripts\activate
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Configure environment
-cp .env.example .env
-# Edit .env if needed (defaults work out of the box)
+# 4. Review config.yaml and adjust if needed (defaults work out of the box)
 
 # 5. Start the server
-uvicorn app.main:app --reload --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 The API is available at `http://localhost:8000`.
@@ -149,38 +89,47 @@ docker compose up --build
 docker compose down
 ```
 
-To persist the cluster state across restarts, set `CLUSTER_MODEL_SAVE_PATH=./data/model` in `.env`. The compose file already mounts `./data/model` into the container.
+To persist the FAISS index across restarts, the compose file mounts `./data/model` into the container. Set `save_path` in `config.yaml` to `/app/data/model` to enable persistence.
 
 ---
 
 ## API Reference
 
+### `GET /health` — Health check
+
+```json
+{
+  "status": "ok"
+}
+```
+
+---
+
 ### `POST /api/v1/clusters` — Cluster sentences
 
-Submit sentences to the clustering engine. Returns all clusters that currently meet the `least_items` threshold.
+Submit a list of raw sentence strings. Returns clusters that meet the `least_items` threshold.
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `threshold` | float (0–1) | from config | Cosine similarity to join a cluster |
+| `least_items` | int ≥ 1 | 2 | Min cluster size to return |
+| `limit_cluster` | int ≥ 0 | 0 (no limit) | Max number of clusters to return |
 
 **Request body**
 
 ```json
 {
   "sentences": [
-    { "id": "doc-1", "text": "ราคาน้ำมันพุ่งสูงขึ้น" },
-    { "id": "doc-2", "text": "น้ำมันแพงขึ้นอีกครั้ง" },
-    { "id": "doc-3", "text": "หุ้นไทยปรับตัวขึ้น", "timestamp": "2024-01-15T08:00:00" }
-  ],
-  "remove_ids": [],
-  "least_items": 2
+    "ราคาน้ำมันพุ่งสูงขึ้น",
+    "น้ำมันแพงขึ้นอีกครั้ง",
+    "หุ้นไทยปรับตัวขึ้น"
+  ]
 }
 ```
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `sentences` | array | ✓ | Sentences to add |
-| `sentences[].id` | string | ✓ | Unique doc ID |
-| `sentences[].text` | string | ✓ | Sentence text |
-| `sentences[].timestamp` | ISO datetime | | Defaults to request time |
-| `remove_ids` | string[] | | IDs to evict from all clusters |
-| `least_items` | int ≥ 1 | | Min cluster size to return (default 2) |
+`sentences` is a flat list of strings (not objects). Texts are MD5-fingerprinted internally for deduplication.
 
 **Response**
 
@@ -189,82 +138,145 @@ Submit sentences to the clustering engine. Returns all clusters that currently m
   "clusters": [
     {
       "cluster_id": 0,
-      "sentence_ids": ["doc-1", "doc-2"],
-      "count": 2,
-      "created_at": "2024-01-15T08:00:00"
+      "sentences": ["ราคาน้ำมันพุ่งสูงขึ้น", "น้ำมันแพงขึ้นอีกครั้ง"],
+      "count": 2
     }
   ],
   "total_clusters": 1
 }
 ```
 
-Clusters are sorted by `count` descending (most populated first), then `created_at` descending.
+Clusters are sorted by `count` descending (most populated first).
 
 ---
 
-### `GET /api/v1/clusters/stats` — Engine stats
+### `POST /api/v1/clusters/assign` — Assign documents to clusters
+
+Submit an array of documents with `Headline` and `Story` fields. Returns the same documents with an added `Cluster` field.
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `threshold` | float (0–1) | from config | Cosine similarity to join a cluster |
+| `limit_cluster` | int ≥ 0 | 0 (no limit) | Max number of cluster groups to return |
+| `limit_cluster_item` | int ≥ 0 | 0 (no limit) | Max documents per cluster group |
+
+**Request body**
 
 ```json
-{
-  "total_clusters": 42,
-  "active_faiss_entries": 42,
-  "running_cluster_index": 57
-}
+[
+  {
+    "DocumentID": "abc-123",
+    "Headline": "ราคาน้ำมันพุ่งสูง",
+    "Story": "ราคาน้ำมันดิบปรับตัวขึ้นอย่างต่อเนื่อง..."
+  },
+  {
+    "DocumentID": "abc-456",
+    "Headline": "น้ำมันแพงขึ้น",
+    "Story": "ผู้บริโภคได้รับผลกระทบจากราคาน้ำมัน..."
+  }
+]
 ```
 
----
+Accepts either a JSON array or a single object (auto-wrapped to array).
 
-### `GET /health` — Health check
+**Response**
 
 ```json
-{
-  "status": "ok",
-  "total_clusters": 42,
-  "active_faiss_entries": 42,
-  "running_cluster_index": 57
-}
+[
+  {
+    "DocumentID": "abc-123",
+    "Headline": "ราคาน้ำมันพุ่งสูง",
+    "Story": "ราคาน้ำมันดิบปรับตัวขึ้นอย่างต่อเนื่อง...",
+    "Cluster": "0"
+  },
+  {
+    "DocumentID": "abc-456",
+    "Headline": "น้ำมันแพงขึ้น",
+    "Story": "ผู้บริโภคได้รับผลกระทบจากราคาน้ำมัน...",
+    "Cluster": "0"
+  }
+]
 ```
+
+Documents are sorted by cluster size (largest cluster first). Documents that don't match any cluster get `"Cluster": "-1"`.
 
 ---
 
 ## Configuration
 
-All settings use the `CLUSTER_` prefix and can be set as environment variables or in `.env`.
+All settings are in `config.yaml`:
 
-| Variable | Default | Description |
+```yaml
+model:
+  embedding_model_path: facebook/drama-large
+  tokenizer_path: facebook/drama-large
+  max_token: 128
+  use_gpu: false
+
+clustering:
+  threshold: 0.6
+  top_k: 5
+  max_clusters: 1000000
+  batch_size: 64
+
+persistence:
+  save_path: null
+
+api:
+  prefix: /api/v1
+  host: 0.0.0.0
+  port: 50000
+
+logging:
+  level: INFO
+  log_dir: logs
+  max_bytes: 10485760    # 10 MB
+```
+
+| Setting | Default | Description |
 |---|---|---|
-| `CLUSTER_MODEL_NAME` | `paraphrase-multilingual-MiniLM-L12-v2` | HuggingFace model ID |
-| `CLUSTER_MAX_TOKEN` | `128` | Max token length for encoder |
-| `CLUSTER_USE_GPU` | `false` | Use CUDA if available |
-| `CLUSTER_THRESHOLD` | `0.9` | Cosine similarity to join a cluster |
-| `CLUSTER_TOP_K` | `5` | FAISS candidate neighbours |
-| `CLUSTER_MAX_CLUSTERS` | `1000000` | Evict oldest when exceeded |
-| `CLUSTER_BATCH_SIZE` | `64` | Encoder batch size |
-| `CLUSTER_MODEL_SAVE_PATH` | _(empty)_ | Persist state here; leave blank for ephemeral |
-| `CLUSTER_API_PREFIX` | `/api/v1` | URL prefix for all routes |
+| `model.embedding_model_path` | `facebook/drama-large` | HuggingFace model for embeddings |
+| `model.tokenizer_path` | `facebook/drama-large` | HuggingFace tokenizer (usually same as model) |
+| `model.max_token` | `128` | Max token length for encoder |
+| `model.use_gpu` | `false` | Use CUDA if available |
+| `clustering.threshold` | `0.6` | Cosine similarity threshold to join a cluster |
+| `clustering.top_k` | `5` | FAISS candidate neighbours per query |
+| `clustering.max_clusters` | `1000000` | Evict oldest cluster when exceeded |
+| `clustering.batch_size` | `64` | Texts per forward pass |
+| `persistence.save_path` | `null` | Set to a path to persist state on shutdown |
+| `api.prefix` | `/api/v1` | URL prefix for all routes |
+| `api.host` | `0.0.0.0` | Bind address |
+| `api.port` | `50000` | Port number |
+| `logging.level` | `INFO` | Log level (DEBUG, INFO, WARNING, ERROR) |
+| `logging.log_dir` | `logs` | Directory for log files |
+| `logging.max_bytes` | `10485760` | Rotate when log file exceeds this size |
+
+Alternative models (commented out in config):
+
+- `facebook/drama-1b` — larger, slower, potentially higher quality
+- `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` — much smaller & faster (384 dim)
 
 ---
 
 ## Design Decisions
 
-### Why hexagonal architecture?
+### Why stateful-per-request?
 
-Each layer has a single reason to change:
-- Switch from FAISS to a different vector DB → only change `FaissClustererAdapter`
-- Add gRPC transport → only add a new inbound adapter
-- Change business rules (e.g. scoring) → only change `ClusteringService`
+Each request creates a fresh `SentenceClusterer` so state never leaks between calls. The shared `AutoModel` and `AutoTokenizer` are loaded once at startup and reused across requests to avoid redundant model loading.
 
-### Why stateful clustering?
+### Why `ThreadPoolExecutor(1)`?
 
-FAISS maintains the embedding index in memory for sub-millisecond retrieval. Rebuilding the index on every request would be O(n²) per batch. Incremental updates keep latency constant regardless of total corpus size.
-
-### Why `asyncio.Lock` + `ThreadPoolExecutor(1)`?
-
-`SentenceClusterer.update()` mutates shared FAISS state and is **not thread-safe**. The lock ensures serial access. The executor moves CPU-heavy work off the event loop so other async tasks (health checks, etc.) stay responsive during encoding.
+`SentenceClusterer.update()` is CPU-heavy and blocks the event loop. The executor moves this work off the async loop so health checks and other endpoints stay responsive during encoding.
 
 ### Why one process per container (not gunicorn multi-worker)?
 
-Multi-worker gunicorn forks the process, giving each worker an **independent** FAISS index. This is fine for read-only or sharded workloads, but breaks the single shared state model. Instead, scale **horizontally** (see next section).
+Multi-worker gunicorn forks the process, giving each worker an **independent** copy of model weights in memory. Since the model is loaded once and shared via global state, a single process is more memory-efficient. Scale **horizontally** with multiple containers instead (see next section).
+
+### Why MD5 fingerprinting?
+
+Texts are hashed to create stable document IDs for deduplication within a single request. Near-duplicate texts (similarity ≥ 0.99) are also collapsed during the clustering phase.
 
 ---
 
@@ -272,9 +284,9 @@ Multi-worker gunicorn forks the process, giving each worker an **independent** F
 
 ### Single-instance optimisation (vertical)
 
-- Set `CLUSTER_BATCH_SIZE` higher (e.g. 128) to improve GPU throughput.
-- Enable `CLUSTER_USE_GPU=true` and use `faiss-gpu` for 10–100× faster search.
-- Requests are already queued behind an `asyncio.Lock` — no changes needed.
+- Set `batch_size` higher (e.g. 128) to improve GPU throughput.
+- Enable `use_gpu: true` for 10–100× faster encoding.
+- Consider ONNX Runtime for 2–4× CPU inference speedup without changing the model.
 
 ### Horizontal scaling (sharded topics)
 
@@ -287,48 +299,14 @@ Client → Load Balancer (nginx / k8s Ingress)
                └─ ...
 ```
 
-Each shard has its own FAISS state. Route requests consistently to the same shard (e.g. hash `where` or topic key).
+Each shard has its own FAISS state. Route requests consistently to the same shard.
 
-**docker compose scale example**
+The `docker-compose.yml` includes commented-out examples for additional workers and an nginx load balancer.
+
+### Fully stateless scaling
+
+Since each request already gets a fresh `SentenceClusterer`, replicas are fully independent. Standard round-robin load balancing works out of the box.
 
 ```bash
-# Start 3 replicas — add a matching nginx upstream for each
 docker compose up --scale api=3
 ```
-
-### Fully stateless scaling (no shared state needed)
-
-If you don't need state across calls (one-shot clustering per request), disable persistence and add a new endpoint that creates a temporary `SentenceClusterer`, clusters, and discards it. Each replica is then fully independent and stateless — standard round-robin load balancing works.
-
-### Message-queue approach (async / high-throughput)
-
-For very high ingest rates:
-
-```
-Producer → Kafka/RabbitMQ → Worker pool → Results store (Redis/DB)
-                                                 ↑
-                                           GET /results/{job_id}
-```
-
-Add a `POST /api/v1/clusters/async` endpoint that enqueues the request and returns a `job_id`, then a `GET /api/v1/clusters/results/{job_id}` to poll. Workers consume from the queue sequentially, maintaining cluster state safely.
-
----
-
-## How to Add a Feature
-
-### Example: add a new endpoint `GET /api/v1/clusters/{cluster_id}`
-
-1. **schemas.py** — add `ClusterDetailResponse` if needed
-2. **router.py** — add the new route, call the service
-3. **clustering_service.py** — add `get_cluster(cluster_id)` use-case method
-4. **clustering_port.py** — add `get_cluster` to the abstract interface
-5. **faiss_clusterer_adapter.py** — implement `get_cluster`
-6. **ml/sentence_clusterer.py** — add the data accessor if needed
-
-This flow ensures: HTTP concerns stay in the adapter, business logic stays in the service, ML details stay in `ml/`.
-
-### Example: swap FAISS for a hosted vector DB (e.g. Qdrant)
-
-1. Create `app/adapters/outbound/qdrant_clusterer_adapter.py` implementing `ClusteringPort`
-2. In `main.py` lifespan, instantiate `QdrantClustererAdapter` instead of `FaissClustererAdapter`
-3. Zero changes to domain, application, or inbound adapter layers
