@@ -71,7 +71,7 @@ pip install -r requirements.txt
 # 4. Review config.yaml and adjust if needed (defaults work out of the box)
 
 # 5. Start the server
-uvicorn main:app --host 0.0.0.0 --port 8000
+python -m main
 ```
 
 The API is available at `http://localhost:8000`.
