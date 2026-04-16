@@ -1,13 +1,16 @@
 model:
-  # embedding_model_path: intfloat/multilingual-e5-large  ######### Poor results
-  # tokenizer_path: intfloat/multilingual-e5-large        ######### Poor results
-  embedding_model_path: facebook/drama-large            ######### Best results
-  tokenizer_path: facebook/drama-large                  ######### Best results
-  # embedding_model_path: facebook/drama-base
-  # tokenizer_path: facebook/drama-base
-  # embedding_model_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 ######### Base
-  # tokenizer_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2       ######### Base
-  max_token: 128
+  embedding_model_path: jinaai/jina-embeddings-v3-hf                                  ######### 1st Best results fast
+  tokenizer_path: jinaai/jina-embeddings-v3-hf                                        ######### 1nd Best results fast
+  # embedding_model_path: facebook/drama-large                                          ######### 2nd Best results
+  # tokenizer_path: facebook/drama-large                                                ######### 2nd Best results
+  # embedding_model_path: facebook/drama-1b                                             ######### 3rd Best results
+  # tokenizer_path: facebook/drama-1b                                                   ######### 3rd Best results
+  # embedding_model_path: facebook/drama-base                                           ######### Intermediate results
+  # tokenizer_path: facebook/drama-base                                                 ######### Intermediate results
+  # embedding_model_path: jinaai/jina-embeddings-v5-text-small                          ######### Intermediate results
+  # tokenizer_path: jinaai/jina-embeddings-v5-text-small                                ######### Intermediate results
+  # embedding_model_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2   ######### [Base] Intermediate results but fast
+  # tokenizer_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2         ######### [Base] Intermediate
   use_gpu: true
 
 clustering:
