@@ -11,16 +11,13 @@ model:
   # tokenizer_path: jinaai/jina-embeddings-v5-text-small                                ######### Intermediate results
   # embedding_model_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2   ######### [Base] Intermediate results but fast
   # tokenizer_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2         ######### [Base] Intermediate
+  max_token: 128
   use_gpu: true
 
 clustering:
   threshold: 0.6   # default threshold for cosine similarity if request not provided threshold
   top_k: 5          # FAISS candidate neighbours retrieved per query
   max_clusters: 1000000
-  batch_size: 64
-
-persistence:
-  save_path: null   # set to a path, e.g. ./data/model, to persist state on shutdown
 
 api:
   prefix: /api/v1

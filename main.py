@@ -23,8 +23,6 @@ from typing import AsyncIterator, Optional, Union
 import yaml
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from transformers import AutoModel, AutoTokenizer
-
 from sentence_clusterer import SentenceClusterer
 from zip_log_file_handling import setup_logging
 
@@ -43,24 +41,6 @@ logger = logging.getLogger(__name__)
 # Shared state & clustering helper
 # ══════════════════════════════════════════════════════════════════════════════
 
-_model: Optional[AutoModel] = None
-_tokenizer: Optional[AutoTokenizer] = None
-
-
-def _new_clusterer() -> SentenceClusterer:
-    if _model is None or _tokenizer is None:
-        raise RuntimeError("Shared model/tokenizer not initialised — check lifespan.")
-    return SentenceClusterer(
-        model=_model,
-        tokenizer=_tokenizer,
-        max_token=cfg["model"]["max_token"],
-        threshold=cfg["clustering"]["threshold"],
-        top_k=cfg["clustering"]["top_k"],
-        max_clusters=cfg["clustering"]["max_clusters"],
-        use_gpu=cfg["model"]["use_gpu"],
-    )
-
-
 def _text_id(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
@@ -74,9 +54,6 @@ async def _run_clustering(
     Run the full clustering pipeline: fingerprint → FAISS update → map back to text.
     Each call gets a fresh SentenceClusterer so state never leaks between requests.
     """
-    if threshold is None:
-        threshold = cfg["clustering"]["threshold"]
-
     now = datetime.now()
     doc_ids = [_text_id(t) for t in texts]
     timestamps = [now] * len(texts)
@@ -85,7 +62,7 @@ async def _run_clustering(
     for doc_id, text in zip(doc_ids, texts):
         text_registry.setdefault(doc_id, text)
 
-    clusterer = _new_clusterer()
+    clusterer = SentenceClusterer()
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="faiss")
 
     t0 = time.perf_counter()
@@ -96,7 +73,6 @@ async def _run_clustering(
             texts=texts,
             doc_ids=doc_ids,
             timestamps=timestamps,
-            batch_size=cfg["clustering"]["batch_size"],
             least_items=least_items,
             threshold=threshold,
         ),
@@ -123,30 +99,13 @@ async def _run_clustering(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global _model, _tokenizer
+    # Eagerly load model & tokenizer on startup (cached inside SentenceClusterer)
+    SentenceClusterer()
 
-    m = cfg["model"]
-    device = "cuda" if m["use_gpu"] else "cpu"
-
-    embedding_model_path = m["embedding_model_path"]
-    tokenizer_path = m["tokenizer_path"]
-
+    c = cfg["clustering"]
     logger.info(
-        "Startup — loading model & tokenizer | embedding_model=%s  tokenizer=%s  device=%s  max_token=%d",
-        embedding_model_path, tokenizer_path, device, m["max_token"],
-    )
-
-    t0 = time.perf_counter()
-    _tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    _model = AutoModel.from_pretrained(embedding_model_path).to(device)
-    _model.eval()
-    elapsed = time.perf_counter() - t0
-
-    logger.info("Model & tokenizer ready | elapsed=%.2fs  hidden_size=%d", elapsed, _model.config.hidden_size)
-    logger.info(
-        "Clustering config | threshold=%.2f  top_k=%d  max_clusters=%s  batch_size=%d",
-        cfg["clustering"]["threshold"], cfg["clustering"]["top_k"],
-        cfg["clustering"]["max_clusters"], cfg["clustering"]["batch_size"],
+        "Clustering config | threshold=%.2f  top_k=%d  max_clusters=%s",
+        c["threshold"], c["top_k"], c["max_clusters"],
     )
 
     a = cfg["api"]
@@ -174,7 +133,7 @@ def create_app() -> FastAPI:
             "FAISS-backed approximate nearest-neighbour search and "
             "multilingual sentence embeddings."
         ),
-        version="1.0.0",
+        version="2.1.1",
         lifespan=lifespan,
     )
 
@@ -202,9 +161,6 @@ def create_app() -> FastAPI:
         ):
         
         debug = cfg["debug"]
-        
-        if threshold is None:
-            threshold = cfg["clustering"]["threshold"]
 
         sentences = body.get("sentences", [])
         texts = [t or "" for t in sentences]
@@ -233,7 +189,7 @@ def create_app() -> FastAPI:
         
         debug = cfg["debug"]
         #save body in debug
-        if debug:  
+        if debug:
                 os.makedirs("result", exist_ok=True)
                 logger.info("Debug mode enabled — saving input documents to result/assign_input_{timestamp}.json")
                 with open(f"result/body_{int(time.time())}.json", "w", encoding="utf-8") as f:
@@ -244,9 +200,6 @@ def create_app() -> FastAPI:
             
         logger.info("POST /clusters/assign | documents=%d", len(body))
         try:
-            if threshold is None:
-                threshold = cfg["clustering"]["threshold"]
-
             texts = [f"{doc.get('Headline') or ''} {doc.get('Story') or ''}".strip() for doc in body]
             doc_id_list = [doc.get("DocumentID", "") for doc in body]
 

@@ -14,15 +14,20 @@ import os
 import pickle
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import faiss
 import numpy as np
 import torch
 import torch.nn.functional as F
+import yaml
 from transformers import AutoModel, AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+# ── Load config once at module level ─────────────────────────────────────────
+_cfg = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8")) or {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -37,25 +42,33 @@ def mean_pooling(model_output, attention_mask: torch.Tensor) -> torch.Tensor:
 
 
 class SentenceClusterer:
-    def __init__(
-        self,
-        load_path: Optional[str] = None,
-        model: Optional[AutoModel] = None,
-        tokenizer: Optional[AutoTokenizer] = None,
-        embedding_model_path: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        tokenizer_path: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        max_token: int = 128,
-        threshold: float = 0.9,
-        top_k: int = 5,
-        max_clusters: Optional[int] = None,
-        use_gpu: bool = False,
-    ) -> None:
-        self.use_gpu = use_gpu
-        self.device = "cuda" if use_gpu else "cpu"
-        self.max_token = max_token
+    # Class-level cache — model & tokenizer are loaded once and shared across all instances
+    _model: Optional[AutoModel] = None
+    _tokenizer: Optional[AutoTokenizer] = None
+
+    def __init__(self, load_path: Optional[str] = None) -> None:
+        _m = _cfg["model"]
+        _c = _cfg["clustering"]
+
+        self.use_gpu: bool = _m["use_gpu"]
+        self.device: str = "cuda" if self.use_gpu else "cpu"
+        self.max_token: int = _m["max_token"]
+
+        # ── Model & Tokenizer (load once, cache at class level, Run only when starting "class SentenceClusterer") ──
+        if SentenceClusterer._model is None:
+            logger.info(f"Loading AutoModel & AutoTokenizer | model={_m['embedding_model_path']}  tokenizer={_m['tokenizer_path']}  device={self.device}")
+            t0 = time.perf_counter()
+            SentenceClusterer._tokenizer = AutoTokenizer.from_pretrained(_m["tokenizer_path"])
+            SentenceClusterer._model = AutoModel.from_pretrained(_m["embedding_model_path"]).to(self.device)
+            SentenceClusterer._model.eval()
+            elapsed = time.perf_counter() - t0
+            logger.info(f"Model & tokenizer ready | elapsed={elapsed:.2f}s  hidden_size={SentenceClusterer._model.config.hidden_size}")
+
+        self.model = SentenceClusterer._model
+        self.tokenizer = SentenceClusterer._tokenizer
 
         if load_path:
-            logger.info("Loading SentenceClusterer from disk | path=%s", load_path)
+            logger.info("Loading SentenceClusterer state from disk | path=%s", load_path)
             self._load(load_path)
             logger.info(
                 "Loaded | clusters=%d  embedding_dim=%d  assigned_ids=%d",
@@ -65,26 +78,8 @@ class SentenceClusterer:
             )
             return
 
-        # ── Model ──
-        if model is not None:
-            self.model = model
-            logger.debug("Using pre-loaded shared model | id=%d", id(model))
-        else:
-            logger.info("Loading AutoModel | path=%s  device=%s", embedding_model_path, self.device)
-            self.model = AutoModel.from_pretrained(embedding_model_path).to(self.device)
-            logger.info("AutoModel loaded")
-
-        # ── Tokenizer ──
-        if tokenizer is not None:
-            self.tokenizer = tokenizer
-            logger.debug("Using pre-loaded shared tokenizer | id=%d", id(tokenizer))
-        else:
-            logger.info("Loading AutoTokenizer | path=%s", tokenizer_path)
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-            logger.info("AutoTokenizer loaded")
-
-        self.threshold = threshold
-        self.top_k = top_k
+        self.threshold: float = _c["threshold"]
+        self.top_k: int = _c["top_k"]
         self.embedding_dim: int = self.model.config.hidden_size
         self.index = faiss.IndexIDMap(faiss.IndexFlatIP(self.embedding_dim))
 
@@ -94,24 +89,18 @@ class SentenceClusterer:
         self.cluster_stats: dict[int, dict] = {}
         self.cluster_now_idx: int = 0
         self.oldest_cluster_idx: int = 0
-        self.max_clusters = max_clusters
+        self.max_clusters: Optional[int] = _c["max_clusters"]
         # flat set of all doc_ids currently assigned to any cluster (maintained incrementally)
         self._assigned_ids: set[str] = set()
 
-        logger.debug(
-            "SentenceClusterer initialised | embedding_dim=%d  threshold=%.2f  top_k=%d  max_clusters=%s",
-            self.embedding_dim,
-            self.threshold,
-            self.top_k,
-            self.max_clusters,
-        )
+        logger.debug(f"SentenceClusterer initialised | embedding_dim={self.embedding_dim}  threshold={self.threshold:.2f}  top_k={self.top_k}  max_clusters={self.max_clusters}")
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
-
+    # save index + attributes needed to reconstruct state, but not the model/tokenizer which are cached at class level
     def save(self, save_dir: str) -> None:
-        logger.info("Saving state | dir=%s  clusters=%d", save_dir, len(self.trend))
+        logger.info(f"Saving state | dir={save_dir}  clusters={len(self.trend)}")
         os.makedirs(save_dir, exist_ok=True)
         faiss.write_index(self.index, os.path.join(save_dir, "faiss_index"))
         self.model.save_pretrained(os.path.join(save_dir, "model"))
@@ -130,15 +119,10 @@ class SentenceClusterer:
                 },
                 f,
             )
-        logger.info("State saved successfully | dir=%s", save_dir)
+        logger.info(f"State saved successfully | dir={save_dir}")
 
+    # load index + attributes, but not the model/tokenizer which are cached at class level
     def _load(self, load_dir: str) -> None:
-        self.model = AutoModel.from_pretrained(
-            os.path.join(load_dir, "model")
-        ).to(self.device)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            os.path.join(load_dir, "tokenizer")
-        )
         self.index = faiss.read_index(os.path.join(load_dir, "faiss_index"))
         with open(os.path.join(load_dir, "attributes.pkl"), "rb") as f:
             attrs = pickle.load(f)
@@ -319,7 +303,6 @@ class SentenceClusterer:
         texts: list[str],
         doc_ids: list[str],
         timestamps: list[datetime],
-        batch_size: int = 64,
         least_items: int = 2,
         threshold: float | None = None,
     ) -> list[dict]:
@@ -352,7 +335,7 @@ class SentenceClusterer:
                 "Processing %d new documents | threshold=%.2f",
                 len(f_texts), effective_threshold,
             )
-            self._process_batch(list(f_texts), list(f_ids), list(f_times), batch_size, effective_threshold)
+            self._process_batch(list(f_texts), list(f_ids), list(f_times), effective_threshold)
         else:
             logger.debug("No new documents to process — all inputs were already assigned")
 
@@ -374,7 +357,6 @@ class SentenceClusterer:
         texts: list[str],
         doc_ids: list[str],
         timestamps: list[datetime],
-        batch_size: int,
         threshold: float,
     ) -> None:
         sorted_triples = sorted(zip(texts, doc_ids, timestamps), key=lambda x: x[0])
@@ -426,16 +408,10 @@ class SentenceClusterer:
                 self.cluster_now_idx += 1
                 n_new += 1
 
-        logger.debug(
-            "Phase 2 complete | centroids=%d  join_existing=%d  create_new=%d",
-            len(groups), n_existing, n_new,
-        )
+        logger.debug(f"Phase 2 complete | centroids={len(groups)}  join_existing={n_existing} create_new={n_new}")
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        logger.debug(
-            "_process_batch complete | texts=%d  groups=%d  elapsed=%.1fms",
-            total, len(groups), elapsed_ms,
-        )
+        logger.debug(f"_process_batch complete | texts={total}  groups={len(groups)}  elapsed={elapsed_ms:.1f}ms")
 
     def _cleanup_memory(self) -> None:
         if self.use_gpu:

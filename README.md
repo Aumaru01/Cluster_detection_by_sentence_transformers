@@ -72,8 +72,8 @@ pip install -r requirements.txt
 python -m main
 ```
 
-The API is available at `http://localhost:8000`.
-Interactive docs: `http://localhost:8000/docs`
+The API is available at `http://localhost:[port]`.
+Interactive docs: `http://localhost:[port]/docs`
 
 ---
 
@@ -288,4 +288,3 @@ Each shard has its own FAISS state. Route requests consistently to the same shar
 ### Fully stateless scaling
 
 Since each request already gets a fresh `SentenceClusterer`, replicas are fully independent. Standard round-robin load balancing works out of the box.
-                   
