@@ -14,7 +14,7 @@ model:
   max_token: 128
   use_gpu: true
   precision: auto          # auto | bf16 | fp16 | fp32 — auto picks bf16 on Ampere+, else fp16, CPU always fp32
-  encode_batch_size: 32    # micro-batch size for encoding: lower → less peak VRAM, higher → faster throughput
+  encode_batch_size: 16    # micro-batch size for encoding: lower → less peak VRAM, higher → faster throughput
 
 clustering:
   threshold: 0.6   # default threshold for cosine similarity if request not provided threshold

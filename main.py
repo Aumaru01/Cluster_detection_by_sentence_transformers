@@ -23,7 +23,7 @@ from typing import AsyncIterator, Optional, Union
 import yaml
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from sentence_clusterer import SentenceClusterer
+from sentence_clusterer import SentenceClusterer, _gpu_mem_report
 from zip_log_file_handling import setup_logging
 
 
@@ -107,6 +107,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "Clustering config | threshold=%.2f  top_k=%d  max_clusters=%s",
         c["threshold"], c["top_k"], c["max_clusters"],
     )
+
+    # Startup GPU baseline — captures weight footprint before any traffic.
+    logger.info("GPU memory after startup | %s", _gpu_mem_report())
 
     a = cfg["api"]
     logger.info("API listening | host=%s  port=%d  prefix=%s", a["host"], a["port"], a["prefix"])

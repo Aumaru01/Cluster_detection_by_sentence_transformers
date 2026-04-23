@@ -290,23 +290,16 @@ For `jinaai/jina-embeddings-v3-hf` (hidden size 768) at `max_token=128`, `encode
 
 Actual numbers depend on GPU, driver, and sentence length distribution.
 
-### Observability
+### Observing memory at runtime
 
-Every request logs its own GPU memory snapshot at `INFO` level so you can tune `encode_batch_size` and `precision` against real traffic:
+GPU memory is logged automatically at key points so you can verify the optimisations are working and spot regressions:
 
-```
-INFO  Model & tokenizer ready | elapsed=3.21s  hidden_size=768  dtype=torch.bfloat16
-INFO  GPU memory after model load | allocated=580.4MB  peak=580.4MB  reserved=604.0MB
-INFO  GPU memory during encode   | texts=128  batches=4  allocated=591.8MB  peak=942.1MB  reserved=1024.0MB
-INFO  GPU memory after cleanup   | allocated=582.0MB  peak=942.1MB  reserved=604.0MB
-```
+- **Startup** (`main.py` lifespan, after model load) — `GPU memory after startup | alloc=…GB  peak=…GB  reserved=…GB  free=…/…GB`. Shows the resident weight footprint before any traffic.
+- **Per encode call** (`sentence_clusterer.py::encode`) — `Encoding done | … gpu_mem=[alloc=…  peak=…  reserved=…  free=…]`. `peak` is reset at the start of each call, so it reflects that call's high-water mark only — the quickest way to see whether `encode_batch_size` is the right size.
+- **Per update call** (`sentence_clusterer.py::update`) — `Update complete | … gpu_mem=[…]`. Confirms memory has been released after `_cleanup_memory()`.
+- **Cache flush** (DEBUG level) — `CUDA cache cleared | gpu_mem=[…]`.
 
-Fields:
-- `allocated` — live tensors PyTorch is holding right now
-- `peak` — highest `allocated` since the last reset (reset on startup and after each request)
-- `reserved` — total VRAM PyTorch's cached allocator is holding (includes free blocks it keeps for reuse)
-
-Use `peak` to size your batch — if `peak` approaches total GPU memory, lower `encode_batch_size`; if it's well under, raise it for better throughput.
+The helper `_gpu_mem_report()` is exported from `sentence_clusterer` and can be called from anywhere else you want an ad-hoc probe. On CPU-only hosts it returns `"gpu_unavailable"` instead of crashing.
 
 ---
 

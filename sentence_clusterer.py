@@ -42,6 +42,42 @@ def mean_pooling(model_output, attention_mask: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _gpu_mem_report(reset_peak: bool = False) -> str:
+    """
+    Human-readable GPU memory snapshot for the current CUDA device.
+
+    Format: ``alloc=1.23GB  peak=2.45GB  reserved=2.67GB  free=5.12/24.00GB``
+
+    * ``alloc``     — tensors currently held by PyTorch.
+    * ``peak``      — high-water mark since the last reset (reset on startup by default).
+    * ``reserved``  — memory the caching allocator has reserved from CUDA.
+    * ``free/total``— device-wide free and total VRAM (other processes included).
+
+    Returns ``"gpu_unavailable"`` when CUDA isn't usable. Pass ``reset_peak=True``
+    to start a fresh per-operation peak measurement.
+    """
+    if not torch.cuda.is_available():
+        return "gpu_unavailable"
+
+    GB = 1024 ** 3
+    try:
+        alloc = torch.cuda.memory_allocated() / GB
+        peak = torch.cuda.max_memory_allocated() / GB
+        reserved = torch.cuda.memory_reserved() / GB
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        free_gb, total_gb = free_bytes / GB, total_bytes / GB
+
+        if reset_peak:
+            torch.cuda.reset_peak_memory_stats()
+
+        return (
+            f"alloc={alloc:.2f}GB  peak={peak:.2f}GB  "
+            f"reserved={reserved:.2f}GB  free={free_gb:.2f}/{total_gb:.2f}GB"
+        )
+    except Exception as e:  # pragma: no cover — diagnostics only, never crash
+        return f"gpu_mem_report_failed: {e}"
+
+
 def _resolve_dtype(use_gpu: bool, requested: str) -> torch.dtype:
     """
     Pick the best torch dtype for the target device.
@@ -71,28 +107,6 @@ def _resolve_dtype(use_gpu: bool, requested: str) -> torch.dtype:
     if torch.cuda.is_bf16_supported():
         return torch.bfloat16
     return torch.float16
-
-
-def _gpu_mem_snapshot(reset_peak: bool = False) -> str:
-    """
-    Return a compact string describing current GPU memory state, or "" when CUDA
-    isn't available. ``reset_peak=True`` zeroes ``max_memory_allocated`` so the
-    next call reports peak usage relative to right now.
-
-    Fields:
-      allocated — live tensor bytes the caller owns
-      peak      — highest ``allocated`` reached since the last reset
-      reserved  — cached allocator pool (allocated + free blocks held by PyTorch)
-    """
-    if not torch.cuda.is_available():
-        return ""
-    mb = 1024 * 1024
-    allocated = torch.cuda.memory_allocated() / mb
-    peak = torch.cuda.max_memory_allocated() / mb
-    reserved = torch.cuda.memory_reserved() / mb
-    if reset_peak:
-        torch.cuda.reset_peak_memory_stats()
-    return f"allocated={allocated:.1f}MB  peak={peak:.1f}MB  reserved={reserved:.1f}MB"
 
 
 class SentenceClusterer:
@@ -146,16 +160,17 @@ class SentenceClusterer:
 
             SentenceClusterer._model.eval()
             elapsed = time.perf_counter() - t0
+
+            # Reset peak stats so the first encode() reports per-operation peak only,
+            # not the transient spike from weight upload.
+            if self.use_gpu and torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
             logger.info(
-                "Model & tokenizer ready | elapsed=%.2fs  hidden_size=%d  dtype=%s",
+                "Model & tokenizer ready | elapsed=%.2fs  hidden_size=%d  dtype=%s  gpu_mem=[%s]",
                 elapsed, SentenceClusterer._model.config.hidden_size, SentenceClusterer._dtype,
+                _gpu_mem_report(),
             )
-            # Baseline VRAM — what the model weights alone cost. Reset peak so
-            # subsequent encode() calls report peak usage relative to this baseline.
-            if self.use_gpu:
-                mem = _gpu_mem_snapshot(reset_peak=True)
-                if mem:
-                    logger.info("GPU memory after model load | %s", mem)
 
         self.model = SentenceClusterer._model
         self.tokenizer = SentenceClusterer._tokenizer
@@ -260,7 +275,7 @@ class SentenceClusterer:
         logger.debug("Encoding %d texts | device=%s  dtype=%s  batch_size=%d", n, self.device, self._dtype, self.encode_batch_size)
         t0 = time.perf_counter()
 
-        # Reset peak stats so ``max_memory_allocated`` reflects this encode() call only.
+        # Reset peak so the peak reported below reflects this encode() call only.
         if self.use_gpu and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
@@ -306,22 +321,24 @@ class SentenceClusterer:
             for row_idx, original_i in enumerate(batch_idx):
                 out[original_i] = emb_cpu[row_idx]
 
+        # Capture peak BEFORE flushing the cache — empty_cache() doesn't affect peak
+        # but this keeps the ordering explicit.
+        gpu_mem = _gpu_mem_report() if self.use_gpu else ""
         if self.use_gpu:
-            # Capture peak BEFORE empty_cache so the log shows the true high-water
-            # mark the forward passes reached, not the post-cleanup value.
-            mem = _gpu_mem_snapshot(reset_peak=False)
             torch.cuda.empty_cache()
-            if mem:
-                logger.info(
-                    "GPU memory during encode | texts=%d  batches=%d  %s",
-                    n, (n + batch_size - 1) // batch_size, mem,
-                )
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        logger.debug(
-            "Encoding done | texts=%d  shape=%s  elapsed=%.1fms  batches=%d",
-            n, out.shape, elapsed_ms, (n + batch_size - 1) // batch_size,
-        )
+        n_batches = (n + batch_size - 1) // batch_size
+        if self.use_gpu:
+            logger.info(
+                "Encoding done | texts=%d  shape=%s  elapsed=%.1fms  batches=%d  gpu_mem=[%s]",
+                n, out.shape, elapsed_ms, n_batches, gpu_mem,
+            )
+        else:
+            logger.debug(
+                "Encoding done | texts=%d  shape=%s  elapsed=%.1fms  batches=%d",
+                n, out.shape, elapsed_ms, n_batches,
+            )
         return out
 
     # ------------------------------------------------------------------
@@ -487,13 +504,15 @@ class SentenceClusterer:
         self._cleanup_memory()
         result = self._build_result(least_items)
 
+        extra = f"  gpu_mem=[{_gpu_mem_report()}]" if self.use_gpu else ""
         logger.info(
             "Update complete | total_clusters=%d  qualifying_clusters=%d  "
-            "assigned_ids=%d  index_size=%d",
+            "assigned_ids=%d  index_size=%d%s",
             len(self.trend),
             len(result),
             len(self._assigned_ids),
             self.index.ntotal,
+            extra,
         )
         return result
 
@@ -561,11 +580,7 @@ class SentenceClusterer:
     def _cleanup_memory(self) -> None:
         if self.use_gpu:
             torch.cuda.empty_cache()
-            mem = _gpu_mem_snapshot(reset_peak=True)
-            if mem:
-                logger.info("GPU memory after cleanup | %s", mem)
-            else:
-                logger.debug("CUDA cache cleared")
+            logger.debug("CUDA cache cleared | gpu_mem=[%s]", _gpu_mem_report())
 
     def _build_result(self, least_items: int) -> list[dict]:
         result = sorted(
