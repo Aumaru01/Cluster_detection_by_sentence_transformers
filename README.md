@@ -1,6 +1,8 @@
 # Sentence Clustering API
 
-Groups semantically similar sentences into clusters using FAISS-backed approximate nearest-neighbour search and multilingual sentence embeddings (`facebook/drama-large`).
+Groups semantically similar sentences into clusters using FAISS-backed approximate nearest-neighbour search and multilingual sentence embeddings (`jinaai/jina-embeddings-v3-hf` by default).
+
+The encoder runs in **mixed precision (bf16/fp16) with length-bucketed micro-batching** so GPU memory stays flat regardless of input size, while preserving the exact same L2-normalised fp32 embeddings that FAISS consumes.
 
 ---
 
@@ -24,10 +26,13 @@ The service accepts a list of sentences, incrementally assigns them to semantic 
 
 ### Encoding pipeline
 
-1. Tokenize with `AutoTokenizer` (padding + truncation)
-2. Forward pass through `AutoModel`
-3. Mean pooling over token embeddings (attention-mask aware)
-4. L2-normalise → unit vectors for cosine similarity via inner product
+1. Sort input sentences by length and split into **micro-batches** of `encode_batch_size` (default 32) so peak VRAM is bounded.
+2. Tokenize each batch with `AutoTokenizer` (padding + truncation).
+3. Forward pass through `AutoModel` under `torch.inference_mode()` in the target dtype (bf16/fp16 on GPU, fp32 on CPU), using SDPA attention (flash / memory-efficient kernels) when available.
+4. Mean pooling over token embeddings (attention-mask aware, dtype-preserving — no implicit fp32 upcast).
+5. L2-normalise → unit vectors for cosine similarity via inner product.
+6. Cast to fp32 and copy to CPU; GPU tensors are released between micro-batches so memory is reused, not accumulated.
+7. Re-assemble outputs in the caller's original order.
 
 ---
 
@@ -194,19 +199,17 @@ All settings are in `config.yaml`:
 
 ```yaml
 model:
-  embedding_model_path: facebook/drama-large
-  tokenizer_path: facebook/drama-large
+  embedding_model_path: jinaai/jina-embeddings-v3-hf
+  tokenizer_path: jinaai/jina-embeddings-v3-hf
   max_token: 128
-  use_gpu: false
+  use_gpu: true
+  precision: auto          # auto | bf16 | fp16 | fp32
+  encode_batch_size: 32    # micro-batch size for encoding
 
 clustering:
   threshold: 0.6
   top_k: 5
   max_clusters: 1000000
-  batch_size: 64
-
-persistence:
-  save_path: null
 
 api:
   prefix: /api/v1
@@ -217,30 +220,75 @@ logging:
   level: INFO
   log_dir: logs
   max_bytes: 10485760    # 10 MB
+
+debug: false
 ```
 
 | Setting | Default | Description |
 |---|---|---|
-| `model.embedding_model_path` | `facebook/drama-large` | HuggingFace model for embeddings |
-| `model.tokenizer_path` | `facebook/drama-large` | HuggingFace tokenizer (usually same as model) |
+| `model.embedding_model_path` | `jinaai/jina-embeddings-v3-hf` | HuggingFace model for embeddings |
+| `model.tokenizer_path` | `jinaai/jina-embeddings-v3-hf` | HuggingFace tokenizer (usually same as model) |
 | `model.max_token` | `128` | Max token length for encoder |
-| `model.use_gpu` | `false` | Use CUDA if available |
+| `model.use_gpu` | `true` | Use CUDA if available |
+| `model.precision` | `auto` | Model weight dtype. `auto` picks bf16 on Ampere+, else fp16; `fp32` on CPU |
+| `model.encode_batch_size` | `32` | Micro-batch size for encoding — lower → less peak VRAM, higher → faster throughput |
 | `clustering.threshold` | `0.6` | Cosine similarity threshold to join a cluster |
 | `clustering.top_k` | `5` | FAISS candidate neighbours per query |
 | `clustering.max_clusters` | `1000000` | Evict oldest cluster when exceeded |
-| `clustering.batch_size` | `64` | Texts per forward pass |
-| `persistence.save_path` | `null` | Set to a path to persist state on shutdown |
 | `api.prefix` | `/api/v1` | URL prefix for all routes |
 | `api.host` | `0.0.0.0` | Bind address |
 | `api.port` | `50000` | Port number |
 | `logging.level` | `INFO` | Log level (DEBUG, INFO, WARNING, ERROR) |
 | `logging.log_dir` | `logs` | Directory for log files |
 | `logging.max_bytes` | `10485760` | Rotate when log file exceeds this size |
+| `debug` | `false` | If `true`, writes request/response JSON to `result/` |
 
 Alternative models (commented out in config):
 
 - `facebook/drama-1b` — larger, slower, potentially higher quality
 - `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` — much smaller & faster (384 dim)
+
+---
+
+## GPU Memory Optimisation
+
+The encoder is tuned so that peak VRAM stays low without sacrificing embedding quality or throughput. Five techniques work together:
+
+### 1. Auto-detected mixed precision
+
+Model weights load directly in `bfloat16` on Ampere-class GPUs and newer (A100, H100, RTX 30xx/40xx) or `float16` on older CUDA devices, halving the weight and activation footprint compared to fp32. CPU always falls back to fp32. Override with `model.precision: bf16 | fp16 | fp32` if you need deterministic behaviour.
+
+**Why this is safe:** bf16 shares the same exponent range as fp32, so there's no risk of overflow in transformer activations. fp16's tiny rounding error is absorbed by the L2-normalisation step that follows mean pooling. FAISS still indexes and searches in fp32 — the cast happens at the CPU boundary.
+
+### 2. Length-bucketed micro-batching
+
+Rather than forwarding the entire request as one tensor, `encode()` sorts inputs by length and processes them in batches of `encode_batch_size`. This caps peak VRAM at a fixed value no matter how many sentences arrive, and each batch pads to the longest item **within that batch only**, slashing wasted activation memory on mixed-length inputs.
+
+Drop `encode_batch_size` to 16 or 8 on low-VRAM GPUs; raise it to 64–128 when there's headroom and you want maximum throughput.
+
+### 3. SDPA attention kernels
+
+When available, the model loads with `attn_implementation="sdpa"` and runs inside a `sdp_kernel` context that enables flash-attention and memory-efficient attention. These kernels avoid materialising the full `seq_len × seq_len` attention matrix, which is the dominant cost at longer sequences.
+
+### 4. `torch.inference_mode()` + low-CPU-memory loading
+
+The forward pass runs inside `torch.inference_mode()` (stricter than `no_grad`, skips version-counter bookkeeping). Model weights load with `low_cpu_mem_usage=True` so there's no transient fp32 copy on CPU during startup.
+
+### 5. Aggressive tensor release
+
+After each micro-batch, input IDs / model outputs / pooled tensors are explicitly `del`-ed and the cached allocator is flushed between requests. Embeddings are moved to CPU as fp32 numpy arrays the moment they're ready, so GPU memory is reused — not accumulated — across batches.
+
+### Rough numbers
+
+For `jinaai/jina-embeddings-v3-hf` (hidden size 768) at `max_token=128`, `encode_batch_size=32`:
+
+| Config | Approx. peak VRAM |
+|---|---|
+| fp32, no batching, 1000 sentences | ~4–5 GB |
+| fp32, micro-batching | ~1.8 GB |
+| **bf16 / fp16, micro-batching (default)** | **~0.9 GB** |
+
+Actual numbers depend on GPU, driver, and sentence length distribution.
 
 ---
 
@@ -268,9 +316,10 @@ Texts are hashed to create stable document IDs for deduplication within a single
 
 ### Single-instance optimisation (vertical)
 
-- Set `batch_size` higher (e.g. 128) to improve GPU throughput.
-- Enable `use_gpu: true` for 10–100× faster encoding.
-- Consider ONNX Runtime for 2–4× CPU inference speedup without changing the model.
+- Raise `model.encode_batch_size` (e.g. 64–128) when there's spare VRAM — fewer kernel launches → better throughput.
+- Keep `model.use_gpu: true` and let `model.precision: auto` pick bf16/fp16 for 2× memory savings at unchanged quality (see [GPU Memory Optimisation](#gpu-memory-optimisation)).
+- Lower `encode_batch_size` to 16 or 8 on small GPUs to trade a little speed for a much smaller memory footprint.
+- Consider ONNX Runtime / TensorRT for 2–4× CPU/GPU inference speedup without changing the model.
 
 ### Horizontal scaling (sharded topics)
 

@@ -13,6 +13,8 @@ model:
   # tokenizer_path: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2         ######### [Base] Intermediate
   max_token: 128
   use_gpu: true
+  precision: auto          # auto | bf16 | fp16 | fp32 — auto picks bf16 on Ampere+, else fp16, CPU always fp32
+  encode_batch_size: 32    # micro-batch size for encoding: lower → less peak VRAM, higher → faster throughput
 
 clustering:
   threshold: 0.6   # default threshold for cosine similarity if request not provided threshold
@@ -29,4 +31,4 @@ logging:
   log_dir: logs        # directory to write log files
   max_bytes: 10485760  # 10 MB — rotate when file exceeds this size
 
-debug: false          # if true, saves input and output of /clusters/assign to result/ with timestamped filenames
+debug: false          # if true, saves input and output of /clusters/assign to res

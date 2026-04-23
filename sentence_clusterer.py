@@ -35,16 +35,49 @@ _cfg = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8")) or {}
 def mean_pooling(model_output, attention_mask: torch.Tensor) -> torch.Tensor:
     """Average token embeddings weighted by the attention mask."""
     token_embeddings = model_output[0]  # (batch, seq_len, hidden)
-    mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    # keep the mask in the same dtype as token_embeddings to avoid an implicit fp32 upcast
+    mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).to(token_embeddings.dtype)
     return torch.sum(token_embeddings * mask_expanded, dim=1) / torch.clamp(
         mask_expanded.sum(dim=1), min=1e-9
     )
+
+
+def _resolve_dtype(use_gpu: bool, requested: str) -> torch.dtype:
+    """
+    Pick the best torch dtype for the target device.
+
+    Rules:
+      * CPU → always fp32 (fp16/bf16 on CPU is slower and not worth it).
+      * GPU + 'auto' → bf16 if hardware supports it (Ampere+), else fp16.
+      * GPU + explicit 'bf16' / 'fp16' / 'fp32' → honour the request, with a safe
+        fallback to fp16 if bf16 isn't supported on this GPU.
+    """
+    req = (requested or "auto").strip().lower()
+
+    if not use_gpu or not torch.cuda.is_available():
+        return torch.float32
+
+    if req == "fp32":
+        return torch.float32
+    if req == "fp16":
+        return torch.float16
+    if req == "bf16":
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        logger.warning("bf16 requested but GPU does not support it — falling back to fp16")
+        return torch.float16
+
+    # auto
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
 
 
 class SentenceClusterer:
     # Class-level cache — model & tokenizer are loaded once and shared across all instances
     _model: Optional[AutoModel] = None
     _tokenizer: Optional[AutoTokenizer] = None
+    _dtype: torch.dtype = torch.float32
 
     def __init__(self, load_path: Optional[str] = None) -> None:
         _m = _cfg["model"]
@@ -53,19 +86,52 @@ class SentenceClusterer:
         self.use_gpu: bool = _m["use_gpu"]
         self.device: str = "cuda" if self.use_gpu else "cpu"
         self.max_token: int = _m["max_token"]
+        # micro-batch size for encoding — caps peak VRAM regardless of input length
+        self.encode_batch_size: int = int(_m.get("encode_batch_size", 32))
 
         # ── Model & Tokenizer (load once, cache at class level, Run only when starting "class SentenceClusterer") ──
         if SentenceClusterer._model is None:
-            logger.info(f"Loading AutoModel & AutoTokenizer | model={_m['embedding_model_path']}  tokenizer={_m['tokenizer_path']}  device={self.device}")
+            precision_cfg = _m.get("precision", "auto")
+            dtype = _resolve_dtype(self.use_gpu, precision_cfg)
+            SentenceClusterer._dtype = dtype
+
+            logger.info(
+                "Loading AutoModel & AutoTokenizer | model=%s  tokenizer=%s  device=%s  dtype=%s  precision=%s",
+                _m["embedding_model_path"], _m["tokenizer_path"], self.device, dtype, precision_cfg,
+            )
             t0 = time.perf_counter()
             SentenceClusterer._tokenizer = AutoTokenizer.from_pretrained(_m["tokenizer_path"])
-            SentenceClusterer._model = AutoModel.from_pretrained(_m["embedding_model_path"]).to(self.device)
+
+            # Load weights directly into the target dtype — avoids the fp32 copy on CPU
+            # that `low_cpu_mem_usage=True` further reduces. SDPA attention cuts the
+            # attention-matrix memory footprint when the model's config supports it.
+            load_kwargs = {
+                "torch_dtype": dtype,
+                "low_cpu_mem_usage": True,
+            }
+            try:
+                SentenceClusterer._model = AutoModel.from_pretrained(
+                    _m["embedding_model_path"],
+                    attn_implementation="sdpa",
+                    **load_kwargs,
+                ).to(self.device)
+            except (TypeError, ValueError) as e:
+                logger.info("SDPA attention not supported for this model — using default attention (%s)", e)
+                SentenceClusterer._model = AutoModel.from_pretrained(
+                    _m["embedding_model_path"],
+                    **load_kwargs,
+                ).to(self.device)
+
             SentenceClusterer._model.eval()
             elapsed = time.perf_counter() - t0
-            logger.info(f"Model & tokenizer ready | elapsed={elapsed:.2f}s  hidden_size={SentenceClusterer._model.config.hidden_size}")
+            logger.info(
+                "Model & tokenizer ready | elapsed=%.2fs  hidden_size=%d  dtype=%s",
+                elapsed, SentenceClusterer._model.config.hidden_size, SentenceClusterer._dtype,
+            )
 
         self.model = SentenceClusterer._model
         self.tokenizer = SentenceClusterer._tokenizer
+        self._dtype = SentenceClusterer._dtype
 
         if load_path:
             logger.info("Loading SentenceClusterer state from disk | path=%s", load_path)
@@ -145,39 +211,78 @@ class SentenceClusterer:
         """
         Tokenize → forward → mean pooling → L2 normalise.
 
-        Returns (N, hidden_size) float32 numpy array of unit-length embeddings.
+        Memory-minimising strategy:
+          * Split inputs into micro-batches of ``self.encode_batch_size`` so peak VRAM
+            stays constant regardless of how many texts the caller passes in.
+          * Within each call, process batches in ascending-length order. Shorter batches
+            pad to shorter sequences, wasting less activation memory than a single
+            uniformly long batch would.
+          * Run the forward pass under ``torch.inference_mode()`` — stricter than
+            ``no_grad`` and skips version-counter bookkeeping, saving a small amount
+            of memory and overhead.
+          * Release GPU tensors the moment embeddings are copied to CPU.
+
+        Returns (N, hidden_size) float32 numpy array of unit-length embeddings
+        in the caller's original order.
         """
-        logger.debug("Encoding %d texts | device=%s", len(texts), self.device)
+        n = len(texts)
+        if n == 0:
+            return np.zeros((0, self.embedding_dim), dtype=np.float32)
+
+        logger.debug("Encoding %d texts | device=%s  dtype=%s  batch_size=%d", n, self.device, self._dtype, self.encode_batch_size)
         t0 = time.perf_counter()
 
-        # 1. Tokenize
-        encoded_input = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_token,
-            return_tensors="pt",
-        ).to(self.device)
+        # Sort indices by raw character length — a cheap, tokenizer-free proxy for
+        # token count. Groups similar-length items together so padding waste stays low.
+        order = sorted(range(n), key=lambda i: len(texts[i]))
 
-        # 2. Forward pass (no gradient needed)
-        with torch.no_grad():
-            model_output = self.model(**encoded_input)
+        out = np.empty((n, self.embedding_dim), dtype=np.float32)
+        batch_size = max(1, self.encode_batch_size)
 
-        # 3. Mean pooling
-        sentence_embeddings = mean_pooling(model_output, encoded_input["attention_mask"])
+        # Prefer the memory-efficient SDPA kernel when we're on GPU with fp16/bf16.
+        use_sdpa_ctx = self.use_gpu and self._dtype in (torch.float16, torch.bfloat16)
 
-        # 4. L2 normalise
-        sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
+        for start in range(0, n, batch_size):
+            batch_idx = order[start:start + batch_size]
+            batch_texts = [texts[i] for i in batch_idx]
 
-        result = sentence_embeddings.cpu().numpy().astype(np.float32)
+            encoded = self.tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_token,
+                return_tensors="pt",
+            ).to(self.device)
+
+            with torch.inference_mode():
+                if use_sdpa_ctx:
+                    with torch.backends.cuda.sdp_kernel(
+                        enable_flash=True, enable_mem_efficient=True, enable_math=True
+                    ):
+                        model_output = self.model(**encoded)
+                else:
+                    model_output = self.model(**encoded)
+                pooled = mean_pooling(model_output, encoded["attention_mask"])
+                pooled = F.normalize(pooled, p=2, dim=1)
+
+            # Copy to CPU as fp32 — FAISS IndexFlatIP requires float32. Doing the
+            # cast here (instead of keeping GPU tensors alive) lets autograd/tensor
+            # memory be reclaimed before the next batch.
+            emb_cpu = pooled.detach().to(dtype=torch.float32, device="cpu").numpy()
+            del encoded, model_output, pooled
+
+            for row_idx, original_i in enumerate(batch_idx):
+                out[original_i] = emb_cpu[row_idx]
+
+        if self.use_gpu:
+            torch.cuda.empty_cache()
+
         elapsed_ms = (time.perf_counter() - t0) * 1000
         logger.debug(
-            "Encoding done | texts=%d  shape=%s  elapsed=%.1fms",
-            len(texts),
-            result.shape,
-            elapsed_ms,
+            "Encoding done | texts=%d  shape=%s  elapsed=%.1fms  batches=%d",
+            n, out.shape, elapsed_ms, (n + batch_size - 1) // batch_size,
         )
-        return result
+        return out
 
     # ------------------------------------------------------------------
     # Internal cluster operations
